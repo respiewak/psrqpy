@@ -18,100 +18,227 @@ from collections import OrderedDict
 
 from .config import ATNF_BASE_URL, ATNF_VERSION, ADS_URL, ATNF_TARBALL, PSR_ALL, PSR_ALL_PARS, GLITCH_URL
 
+
+# set formatting of warnings to not include line number and code (see
+# e.g. https://pymotw.com/3/warnings/#formatting)
+def warning_format(message, category, filename, lineno, file=None, line=None):
+    return '{}: {}'.format(category.__name__, message)
+
+
+warnings.formatwarning = warning_format
+
+
 # problematic references that are hard to parse
-PROB_REFS = ['bwck08']
+PROB_REFS = ['bwck08', 'crf+18']
 
 
-def get_catalogue():
+def get_catalogue(path_to_db=None):
     """
     This function will attempt to download the entire ATNF catalogue `tarball
-    <http://www.atnf.csiro.au/people/pulsar/psrcat/downloads/psrcat_pkg.tar.gz>`_ and convert it to
-    an :class:`astropy.table.Table`. This is based on the method in the `ATNF.ipynb
-    <https://github.com/astrophysically/ATNF-Pulsar-Cat/blob/master/ATNF.ipynb>`_ notebook by
-    Joshua Tan (`@astrophysically <https://github.com/astrophysically/>`_).
+    <http://www.atnf.csiro.au/people/pulsar/psrcat/downloads/psrcat_pkg.tar.gz>`_
+    and convert it to an :class:`astropy.table.Table`. This is based on the
+    method in the `ATNF.ipynb
+    <https://github.com/astrophysically/ATNF-Pulsar-Cat/blob/master/ATNF.ipynb>`_
+    notebook by Joshua Tan (`@astrophysically <https://github.com/astrophysically/>`_).
+
+    Args:
+        path_to_db (str): if the path to a local version of the database file
+            is given then that will be read in rather than attempting to
+            download the file (defaults to None).
 
     Returns:
         :class:`~astropy.table.Table`: a table containing the entire catalogue.
 
-    Note:
-        At the moment this function does not return a table that includes the uncertainties on the
-        parameters.
     """
 
     try:
-        import tarfile
-    except ImportError:
-        raise ImportError('Problem importing tarfile')
-
-    try:
-        from astropy.table import Table, MaskedColumn
+        from astropy.table import Table
+        from astropy.coordinates import SkyCoord
+        import astropy.units as aunits
     except ImportError:
         raise ImportError('Problem importing astropy')
 
-    # get the tarball
-    try:
-        pulsargzfile = requests.get(ATNF_TARBALL)
-        fp = BytesIO(pulsargzfile.content)  # download and store in memory
-    except IOError:
-        raise IOError('Problem accessing ATNF catalogue tarball')
+    if not path_to_db:
+        try:
+            import tarfile
+        except ImportError:
+            raise ImportError('Problem importing tarfile')
 
-    try:
-        # open tarball
-        pulsargz = tarfile.open(fileobj=fp, mode='r:gz')
+        # get the tarball
+        try:
+            pulsargzfile = requests.get(ATNF_TARBALL)
+            fp = BytesIO(pulsargzfile.content)  # download and store in memory
+        except IOError:
+            raise IOError('Problem accessing ATNF catalogue tarball')
 
-        # extract the database file
-        dbfile = pulsargz.extractfile('psrcat_tar/psrcat.db')
-    except IOError:
-        raise IOError('Problem extracting the database file')
+        try:
+            # open tarball
+            pulsargz = tarfile.open(fileobj=fp, mode='r:gz')
+
+            # extract the database file
+            dbfile = pulsargz.extractfile('psrcat_tar/psrcat.db')
+        except IOError:
+            raise IOError('Problem extracting the database file')
+
+    else:
+        try:
+            dbfile = open(path_to_db)
+        except IOError:
+            raise IOError('Error loading given database file')
 
     breakstring = '@'    # break between each pulsar
     commentstring = '#'  # specifies line is a comment
 
-    psrtable = Table(masked=True)
-    ind = 0  # Keeps track of how many objects
-    psrtable.add_row(None)  # db file jumps right in! Better add the first row.
+    # create list of dictionaries - one for each pulsar
+    psrlist = [{}]
+    formats = {}  # dictionary of formats for each parameter
 
     # loop through lines in dbfile
     for line in dbfile.readlines():
-        dataline = line.decode().split()   # Splits on whitespace
+        if isinstance(line, string_types):
+            dataline = line.split()
+        else:
+            dataline = line.decode().split()   # Splits on whitespace
 
         if dataline[0][0] == commentstring:
             continue
 
         if dataline[0][0] == breakstring:
             # First break comes at the end of the first object and so forth
-            psrtable.add_row(None)
-            ind += 1                 # New object!
-            psrtable.mask[ind] = [True]*len(psrtable.columns)  # Default mask to True
+            psrlist.append({})  # New object!
             continue
 
-        if dataline[0] not in psrtable.colnames:  # Make a new column
-            if dataline[0] in PSR_ALL_PARS:
-                thisdtstr = PSR_ALL[dataline[0]]['format']
-                unitstr = PSR_ALL[dataline[0]]['units']
+        try:
+            psrlist[-1][dataline[0]] = float(dataline[1])
+            if dataline[0] not in formats.keys():
+                formats[dataline[0]] = np.float64
+        except ValueError:
+            psrlist[-1][dataline[0]] = dataline[1]
+            if dataline[0] not in formats.keys():
+                formats[dataline[0]] = np.unicode
+
+        if len(dataline) > 2:
+            # check whether 3rd value is a float (so its an error value) or not
+            try:
+                float(dataline[2])
+                isfloat = True
+            except ValueError:
+                isfloat = False
+
+            if isfloat:
+                # error values are last digit errors, so convert to actual
+                # errors by finding the number of decimal places after the
+                # '.' in the value string
+                val = dataline[1].split(':')[-1]  # account for RA and DEC strings
+
+                try:
+                    float(val)
+                except ValueError:
+                    raise ValueError("Value with error is not convertable to a float")
+
+                if dataline[2][0] == '-' or '.' in dataline[2]:
+                    # negative errors or those with decimal points are absolute values
+                    scalefac = 1.
+                else:
+                    # split on exponent
+                    valsplit = re.split('e|E|d|D', val)
+                    scalefac = 1.
+                    if len(valsplit) == 2:
+                        scalefac = 10**(-int(valsplit[1]))
+
+                    dpidx = valsplit[0].find('.')  # find position of decimal point
+                    if dpidx != -1:  # a point is found
+                        scalefac *= 10**(len(valsplit[0])-dpidx-1)
+
+                # add error column if required
+                psrlist[-1][dataline[0]+'_ERR'] = float(dataline[2])/scalefac  # error entry
+
+                if dataline[0]+'_ERR' not in formats.keys():
+                    formats[dataline[0]+'_ERR'] = np.float64
             else:
-                thisdtstr = 'U128'  # default to string type
-                unitstr = None
+                # add reference column if required
+                psrlist[-1][dataline[0]+'_REF'] = dataline[2]  # reference entry
 
-            newcolumn = MaskedColumn(name=dataline[0], dtype=thisdtstr, mask=True, unit=unitstr, length=ind+1) 
-            psrtable.add_column(newcolumn)
+                if dataline[0]+'_REF' not in formats.keys():
+                    formats[dataline[0]+'_REF'] = np.unicode
 
-        psrtable[dataline[0]][ind] = dataline[1]  # Data entry
-        psrtable[dataline[0]].mask[ind] = False   # Turn off masking for this entry
+            if len(dataline) > 3:
+                # last entry must(!) be a reference
+                psrlist[-1][dataline[0]+'_REF'] = dataline[3]  # reference entry
+                if dataline[0]+'_REF' not in formats.keys():
+                    formats[dataline[0]+'_REF'] = np.unicode
 
-    psrtable.remove_row(ind)  # Final breakstring comes at the end of the file
+    del psrlist[-1]  # Final breakstring comes at the end of the file
+
+    # add RA and DEC in degs and JNAME/BNAME
+    radec = False
+    jname = False
+    bname = False
+    for i, psr in enumerate(list(psrlist)):
+        if 'RAJ' in psr.keys() and 'DECJ' in psr.keys():
+            coord = SkyCoord(psr['RAJ'], psr['DECJ'], unit=(aunits.hourangle, aunits.deg))
+            psrlist[i]['RAJD'] = coord.ra.deg    # right ascension in degrees
+            psrlist[i]['DECJD'] = coord.dec.deg  # declination in degrees
+            radec = True
+
+        # add 'JNAME', 'BNAME' and 'NAME'
+        if 'PSRJ' in psr.keys():
+            psrlist[i]['JNAME'] = psr['PSRJ']
+            psrlist[i]['NAME'] = psr['PSRJ']
+            jname = True
+
+        if 'PSRB' in psr.keys():
+            psrlist[i]['BNAME'] = psr['PSRB']
+            bname = True
+
+            if 'NAME' not in psrlist[i].keys():
+                psrlist[i]['NAME'] = psr['PSRB']
+
+    if radec:
+        formats['RAJD'] = np.float64
+        formats['DECJD'] = np.float64
+
+    if jname:
+        formats['JNAME'] = np.unicode
+    if bname:
+        formats['BNAME'] = np.unicode
+    if jname or bname:
+        formats['NAME'] = np.unicode
+
+    # fill in all entries with all parameters
+    for i, psr in enumerate(list(psrlist)):
+        for key in formats.keys():
+            if key not in psr.keys():
+                psrlist[i][key] = None  # blank value
 
     dbfile.close()   # close tar file
-    pulsargz.close()
-    fp.close()       # close StringIO
+    if not path_to_db:
+        pulsargz.close()
+        fp.close()   # close StringIO
+
+    # convert into astropy table
+    psrtable = Table(data=psrlist)
+
+    # add data format
+    for key in formats.keys():
+        psrtable[key] = psrtable[key].astype(formats[key])
+
+    # add units if known
+    for key in PSR_ALL_PARS:
+        if key in psrtable.colnames:
+            if PSR_ALL[key]['units']:
+                psrtable.columns[key].unit = PSR_ALL[key]['units']
+
+                if PSR_ALL[key]['err'] and key+'_ERR' in psrtable.colnames:
+                    psrtable.columns[key+'_ERR'].unit = PSR_ALL[key]['units']
 
     return psrtable
 
 
 def get_version():
     """
-    Return a string with the ATNF catalogue version number, or default to that defined in
-    `ATNF_VERSION`.
+    Return a string with the ATNF catalogue version number, or default to that
+    defined in `ATNF_VERSION`.
 
     Returns:
         str: the ATNF catalogue version number.
@@ -140,10 +267,10 @@ def get_version():
 
 def get_glitch_catalogue(psr=None):
     """
-    Return a :class:`~astropy.table.Table` containing the `Jodrell Bank pulsar glitch catalogue
-    <http://www.jb.man.ac.uk/pulsar/glitches/gTable.html>`_.  If using data from the glitch
-    catalogue then please cite `Espinoza et al. (2011)
-    <http://adsabs.harvard.edu/abs/2011MNRAS.414.1679E>`_ and the URL
+    Return a :class:`~astropy.table.Table` containing the `Jodrell Bank pulsar
+    glitch catalogue <http://www.jb.man.ac.uk/pulsar/glitches/gTable.html>`_.
+    If using data from the glitch catalogue then please cite `Espinoza et al.
+    (2011) <http://adsabs.harvard.edu/abs/2011MNRAS.414.1679E>`_ and the URL
     `<http://www.jb.man.ac.uk/pulsar/glitches.html>`_.
 
     The output table will contain the following columns:
@@ -160,14 +287,16 @@ def get_glitch_catalogue(psr=None):
      * `Reference`: the glitch publication reference
 
     Args:
-        psr (str): if a pulsar name is given then only the glitches for that pulsar are returned,
-            otherwise all glitches are returned.
+        psr (str): if a pulsar name is given then only the glitches for that
+            pulsar are returned, otherwise all glitches are returned.
 
     Returns:
-        :class:`~astropy.table.Table`: a table containing the entire glitch catalogue.
+        :class:`~astropy.table.Table`: a table containing the entire glitch
+            catalogue.
 
     Example:
-        An example of using this to extract the glitches for the Crab Pulsar would be:
+        An example of using this to extract the glitches for the Crab Pulsar
+        would be:
 
         >>> import psrqpy
         >>> gtable = psrqpy.get_glitch_catalogue(psr='J0534+2200')
@@ -228,7 +357,8 @@ def get_glitch_catalogue(psr=None):
             tabledict['JNAME'].append(jname)
             tabledict['Glitch number'].append(int(tds[3].contents[0].string))
 
-            for j, pname in enumerate(['MJD', 'MJD_ERR', 'DeltaF/F', 'DeltaF/F_ERR', 'DeltaF1/F1',
+            for j, pname in enumerate(['MJD', 'MJD_ERR', 'DeltaF/F',
+                                       'DeltaF/F_ERR', 'DeltaF1/F1',
                                        'DeltaF1/F1_ERR']):
                 try:
                     val = float(tds[4+j].contents[0].string)
@@ -257,7 +387,7 @@ def get_glitch_catalogue(psr=None):
     else:
         if psr not in table['NAME'] and psr not in table['JNAME']:
             warnings.warn("Pulsar '{}' not found in glitch catalogue".format(psr), UserWarning)
-            return None 
+            return None
         else:
             if psr in table['NAME']:
                 return table[table['NAME'] == psr]
@@ -268,12 +398,13 @@ def get_glitch_catalogue(psr=None):
 def get_references(useads=False):
     """
     Return a dictionary of paper
-    `reference <http://www.atnf.csiro.au/research/pulsar/psrcat/psrcat_ref.html>`_ in the ATNF
-    catalogue. The keys are the ref strings given in the ATNF catalogue.
+    `reference <http://www.atnf.csiro.au/research/pulsar/psrcat/psrcat_ref.html>`_
+    in the ATNF catalogue. The keys are the ref strings given in the ATNF
+    catalogue.
 
     Args:
-        useads (bool): boolean to set whether to use the python mod:`ads` module to get
-            the NASA ADS URL for the references
+        useads (bool): boolean to set whether to use the python mod:`ads`
+            module to get the NASA ADS URL for the references
 
     Returns:
         dict: a dictionary of references.
@@ -351,7 +482,7 @@ def get_references(useads=False):
                 authors = re.sub(r'\s+', ' ', refdata[0]).strip().strip('.')  # remove line breaks and extra spaces (and final full-stop)
                 sepauthors = authors.split('.,')
             elif utext is not None:
-                year = int(re.sub('\D', '', dotyeardotlist[1]))  # remove any non-number values
+                year = int(re.sub(r'\D', '', dotyeardotlist[1]))  # remove any non-number values
                 authors = dotyeardotlist[0]
                 sepauthors = authors.split('.,')
             else:
@@ -473,10 +604,200 @@ def get_references(useads=False):
     return refs
 
 
+# string of logical expressions for use in regex parser
+LOGEXPRS = (r'(\bAND\b'        # logical AND
+            r'|\band\b'        # logical AND
+            r'|\&\&'           # logical AND
+            r'|\bOR\b'         # logical OR
+            r'|\bor\b'         # logical OR
+            r'|\|\|'           # logical OR
+            r'|!='             # not equal to
+            r'|=='             # equal to
+            r'|<='             # less than or equal to
+            r'|>='             # greater than or equal to
+            r'|<'              # less than
+            r'|>'              # greater than
+            r'|\('             # left opening bracket
+            r'|\)'             # right closing bracket
+            r'|\bNOT\b'        # logical NOT
+            r'|\bnot\b'        # logical NOT
+            r'|!'              # logical NOT
+            r'|~'              # logical NOT
+            r'|\bASSOC\b'      # pulsar association
+            r'|\bassoc\b'      # pulsar association
+            r'|\bTYPE\b'       # pulsar type
+            r'|\btype\b'       # pulsar type
+            r'|\bBINCOMP\b'    # pulsar binary companion type
+            r'|\bbincomp\b'    # pulsar binary companion type
+            r'|\bEXIST\b'      # pulsar parameter exists in the catalogue
+            r'|\bexist\b'      # pulsar parameter exists in the catalogue
+            r'|\bERROR\b'      # condition on parameter error
+            r'|\berror\b)')    # condition on parameter error
+
+
+def condition(table, expression, exactMatch=False):
+    """
+    Apply a logical expression to a table of values.
+
+    Args:
+        table (:class:`astropy.table.Table`, :class:`pandas.DataFrame`): a
+            table of pulsar data
+        expression (str, :class:`~numpy.ndarray): a string containing a set of
+            logical conditions with respect to pulsar parameter names (also
+            containing `conditions
+            <http://www.atnf.csiro.au/research/pulsar/psrcat/psrcat_help.html?type=normal#condition>`_
+            allowed when accessing the ATNF Pulsar Catalogue), or a boolean
+            array of the same length as the table.
+        exactMatch
+
+    Returns:
+        table: the table of values conforming to the input condition.
+            Depending on the type of input table the returned table will either
+            be a :class:`astropy.table.Table` or :class:`pandas.DataFrame`.
+
+    Example:
+        Some examples this might be:
+
+        1. finding all pulsars with frequencies greater than 100 Hz
+
+        >>> newtable = condition(psrtable, 'F0 > 100')
+
+        2. finding all pulsars with frequencies greater than 50 Hz and
+        period derivatives less than 1e-15 s/s.
+
+        >>> newtable = condition(psrtable, '(F0 > 50) & (P1 < 1e-15)')
+
+        3. finding all pulsars in binary systems
+
+        >>> newtable = condition(psrtable, 'TYPE(BINARY)')
+
+        4. parsing a boolean array equivalent to the first example
+
+        >>> newtable = condition(psrtable, psrtable['F0'] > 100)
+
+    """
+
+    from astropy.table import Table
+    from pandas import DataFrame
+
+    # check if expression is just a boolean array
+    if isinstance(expression, np.ndarray):
+        if expression.dtype != np.bool:
+            raise TypeError("Numpy array must be a boolean array")
+        elif len(expression) != len(table):
+            raise Exception("Boolean array and table must be the same length")
+        else:
+            return table[expression]
+    else:
+        if not isinstance(expression, string_types):
+            raise TypeError("Expression must be a boolean array or a string")
+
+    # parse the expression string and split into tokens
+    reg = re.compile(LOGEXPRS)
+    tokens = reg.split(expression)
+    tokens = [t.strip() for t in tokens if t.strip() != '']
+
+    if isinstance(table, Table):
+        # convert astropy table to pandas DataFrame
+        tab = table.to_pandas()
+    elif not isinstance(table, DataFrame):
+        raise TypeError("Table must be a pandas DataFrame or astropy Table")
+    else:
+        tab = table
+
+    matchTypes = ['ASSOC', 'TYPE', 'BINCOMP', 'EXIST', 'ERROR']
+
+    # parse through tokens and replace as required
+    ntokens = len(tokens)
+    newtokens = []
+    i = 0
+    while i < ntokens:
+        if tokens[i] in [r'&&', r'AND']:
+            # replace synonyms for '&' or 'and'
+            newtokens.append(r'&')
+        elif tokens[i] in [r'||', r'OR']:
+            # replace synonyms for '|' or 'or'
+            newtokens.append(r'|')
+        elif tokens[i] in [r'!', r'NOT', r'not']:
+            # replace synonyms for '~'
+            newtokens.append(r'~')
+        elif tokens[i].upper() in matchTypes:
+            if ntokens < i+3:
+                warnings.warn("A '{}' must be followed by a '(NAME)': ignoring in query".format(tokens[i].upper()), UserWarning)
+            elif tokens[i+1] != '(' or tokens[i+3] != ')':
+                warnings.warn("A '{}' must be followed by a '(NAME)': ignoring in query".format(tokens[i].upper()), UserWarning)
+            else:
+                if tokens[i].upper() == 'ASSOC':
+                    if 'ASSOC' not in tab.keys():
+                        warnings.warn("'ASSOC' parameter not in table: ignoring in query", UserWarning)
+                    elif exactMatch:
+                        newtokens.append(r'(ASSOC == "{}")'.format(tokens[i+2]))
+                    else:
+                        assoc = np.array([tokens[i+2] in a for a in table['ASSOC']])
+                        newtokens.append(r'(@assoc)')
+                elif tokens[i].upper() == 'TYPE':
+                    if tokens[i+2].upper() == 'BINARY':
+                        if 'BINARY' not in tab.keys():
+                            warnings.warn("'BINARY' parameter not in table: ignoring in query", UserWarning)
+                        else:
+                            newtokens.append(r'(BINARY != "None")')
+                    else:
+                        if 'TYPE' not in tab.keys():
+                            warnings.warn("'TYPE' parameter not in table: ignoring in query", UserWarning)
+                        elif exactMatch:
+                            newtokens.append(r'(TYPE == "{}")'.format(tokens[i+2]))
+                        else:
+                            ttype = np.array([tokens[i+2] in a for a in table['TYPE']])
+                            newtokens.append(r'(@ttype)')
+                elif tokens[i].upper() == 'BINCOMP':
+                    if 'BINCOMP' not in tab.keys():
+                        warnings.warn("'BINCOMP' parameter not in table: ignoring in query", UserWarning)
+                    elif exactMatch:
+                        newtokens.append(r'(BINCOMP == "{}")'.format(tokens[i+2]))
+                    else:
+                        bincomp = np.array([tokens[i+2] in a for a in table['BINCOMP']])
+                        newtokens.append(r'(@bincomp)')
+                elif tokens[i].upper() == 'EXIST':
+                    if tokens[i+2] not in tab.keys():
+                        warnings.warn("'{}' does not exist for any pulsar".format(tokens[i+2]), UserWarning)
+                        # create an empty DataFrame
+                        tab = DataFrame(columns=table.keys())
+                        break
+                    else:
+                        newtokens.append('({} != None)'.format(tokens[i+2]))
+                elif tokens[i].upper() == 'ERROR':
+                    if tokens[i+2]+'_ERR' not in tab.keys():
+                        warnings.warn("Error value for '{}' not present: ignoring in query".format(tokens[i+2]), UserWarning)
+                    else:
+                        newtokens.append(r'{}_ERR'.format(tokens[i+2]))
+            i += 2
+        else:
+            newtokens.append(tokens[i])
+
+        i += 1
+
+    # evaluate the expression
+    try:
+        newtab = tab.query(''.join(newtokens))
+    except RuntimeError:
+        raise RuntimeError("Could not parse the query")
+
+    if isinstance(table, Table):
+        # convert back to an astropy table
+        newtab = Table.from_pandas(newtab)
+
+        # re-add any units/types
+        for key in table.colnames:
+            newtab.columns[key].unit = table.columns[key].unit
+            newtab[key] = newtab[key].astype(table[key].dtype)
+
+    return newtab
+
+
 def characteristic_age(period, pdot, braking_idx=3.):
     """
-    Function defining the characteristic age of a pulsar. Returns the characteristic
-    age in using
+    Function defining the characteristic age of a pulsar. Returns the
+    characteristic age in using
 
     .. math::
 
@@ -539,8 +860,9 @@ def age_pdot(period, tau=1e6, braking_idx=3.):
 
 def B_field(period, pdot):
     """
-    Function defining the polar magnetic field strength at the surface of the pulsar
-    in gauss (Equation 5.12 of Lyne & Graham-Smith, Pulsar Astronmy, 2nd edition) with
+    Function defining the polar magnetic field strength at the surface of the
+    pulsar in gauss (Equation 5.12 of Lyne & Graham-Smith, Pulsar Astronmy, 2nd
+    edition) with
 
     .. math::
 
@@ -571,8 +893,8 @@ def B_field(period, pdot):
 
 def B_field_pdot(period, Bfield=1e10):
     """
-    Function to get the period derivative from a given pulsar period and magnetic
-    field strength using
+    Function to get the period derivative from a given pulsar period and
+    magnetic field strength using
 
     .. math::
 
@@ -580,7 +902,8 @@ def B_field_pdot(period, Bfield=1e10):
 
     Args:
         period (list, :class:`~numpy.ndarray`): a list of period values
-        Bfield (float): the polar magnetic field strength (Defaults to :math:`10^{10}` G)
+        Bfield (float): the polar magnetic field strength (Defaults to
+            :math:`10^{10}` G)
 
     Returns:
         :class:`numpy.ndarray`: an array of period derivatives
@@ -598,14 +921,15 @@ def B_field_pdot(period, Bfield=1e10):
 
 def death_line(logP, linemodel='Ip', rho6=1.):
     """
-    The pulsar death line. Returns the base-10 logarithm of the period derivative for the given
-    values of the period.
+    The pulsar death line. Returns the base-10 logarithm of the period
+    derivative for the given values of the period.
 
     Args:
         logP (list, :class:`~numpy.ndarray`): the base-10 log values of period.
-        linemodel (str): a string with one of the above model names. Defaults to ``'Ip'``.
-        rho6 (float): the value of the :math:`\\rho_6` parameter from [ZHM]_ . Defaults to 1 is,
-            which is equivalent to :math:`10^6` cm.
+        linemodel (str): a string with one of the above model names. Defaults
+            to ``'Ip'``.
+        rho6 (float): the value of the :math:`\\rho_6` parameter from [ZHM]_ .
+            Defaults to 1 is, which is equivalent to :math:`10^6` cm.
 
     Returns:
         :class:`numpy.ndarray`: a vector of period derivative values
@@ -641,23 +965,27 @@ def death_line(logP, linemodel='Ip', rho6=1.):
 
 def label_line(ax, line, label, color='k', fs=14, frachoffset=0.1):
     """
-    Add an annotation to the given line with appropriate placement and rotation.
+    Add an annotation to the given line with appropriate placement and
+    rotation.
 
     Based on code from `"How to rotate matplotlib annotation to match a line?"
     <http://stackoverflow.com/a/18800233/230468>`_ and `this
     <https://stackoverflow.com/a/38414616/1862861>`_ answer.
 
     Args:
-        ax (:class:`matplotlib.axes.Axes`): Axes on which the label should be added.
+        ax (:class:`matplotlib.axes.Axes`): Axes on which the label should be
+            added.
         line (:class:`matplotlib.lines.Line2D`): Line which is being labeled.
         label (str): Text which should be drawn as the label.
         color (str): a color string for the label text. Defaults to ``'k'``
         fs (int): the font size for the label text. Defaults to 14.
-        frachoffset (float): a number between 0 and 1 giving the fractional offset of the label
-            text along the x-axis. Defaults to 0.1, i.e. 10%.
+        frachoffset (float): a number between 0 and 1 giving the fractional
+            offset of the label text along the x-axis. Defaults to 0.1, i.e.,
+            10%.
 
     Returns:
-        :class:`matplotlib.text.Text`: an object containing the label information
+        :class:`matplotlib.text.Text`: an object containing the label
+            information
 
     """
     xdata, ydata = line.get_data()
